@@ -60,6 +60,28 @@ Built with the [Meltano Singer SDK](https://sdk.meltano.com).
 
 A full list of supported settings and capabilities is available by running: `tap-jira --about`
 
+## Project key renames
+
+Jira project keys are mutable, but project IDs are stable. To keep warehouse
+data consistent when a project is renamed (re-keyed) - or when an abandoned
+key is later reused by a different project - the `projects` and
+`project_versions` streams are keyed by the stable project ID rather than the
+project key:
+
+* `projects` uses the stable numeric `id` as its primary key. Each record
+  emits the current `key` plus `previousKeys`, the historical keys observed
+  for that project ID (in first-seen order), so records already warehoused
+  under an old key can be resolved to the current project. The mapping is
+  tracked in tap state under `bookmarks.projects.project_key_history` and
+  survives across runs.
+* `project_versions` uses the composite primary key `(projectId, id)`,
+  anchored on the stable project ID of the project whose versions endpoint
+  was queried, and denormalizes the current `projectKey` onto every row.
+
+Because both streams are keyed by project ID, a new project reusing an old key
+never inherits the previous project's key history, and its versions are never
+merged with the previous project's versions downstream.
+
 ## Elastic License 2.0
 
 The licensor grants you a non-exclusive, royalty-free, worldwide, non-sublicensable, non-transferable license to use, copy, distribute, make available, and prepare derivative works of the software.

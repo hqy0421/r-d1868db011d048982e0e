@@ -442,17 +442,26 @@ class ProjectStream(JiraStartAtPaginatedStream):
 
     name = "projects"
     path = "/project/search"
+    # The numeric project ID is stable across renames; the project key is not.
     primary_keys = ("id",)
     replication_key = "id"
     replication_method = "INCREMENTAL"
     records_jsonpath = "$[values][*]"  # Or override `parse_response`.
     instance_name = "values"
 
+    # Stream-state key under which the project-key history is persisted:
+    # {project_id: [keys in first-seen order, last = most recently seen]}.
+    key_history_state_key = "project_key_history"
+
     schema = PropertiesList(
         Property("expand", StringType),
         Property("self", StringType),
         Property("id", StringType),
         Property("key", StringType),
+        Property(
+            "previousKeys",
+            ArrayType(StringType),
+        ),
         Property("name", StringType),
         Property(
             "avatarUrls",
@@ -494,12 +503,56 @@ class ProjectStream(JiraStartAtPaginatedStream):
     ).to_dict()
 
     @override
+    def post_process(self, row: Record, context: Context | None = None) -> Record:
+        """Attach the key history for the project's stable ID.
+
+        Jira project keys are mutable, so records already warehoused under an
+        old key cannot be joined on the current key alone. Every project record
+        therefore carries ``previousKeys``: the historical keys observed for
+        this stable project ID, in first-seen order. The mapping is tracked in
+        stream state so renames are detected across runs.
+        """
+        row["previousKeys"] = self._update_key_history(row.get("id"), row.get("key"))
+        return row
+
+    def _update_key_history(
+        self,
+        project_id: str | None,
+        current_key: str | None,
+    ) -> list[str]:
+        """Record the current key for a stable project ID and return prior keys.
+
+        The history is keyed by project ID, never by key, so a key reused by a
+        different project starts with a fresh, empty history.
+        """
+        if not project_id:
+            return []
+
+        key_history: dict[str, list[str]] = self.stream_state.setdefault(
+            self.key_history_state_key,
+            {},
+        )
+        seen_keys = key_history.setdefault(project_id, [])
+
+        if current_key and (not seen_keys or seen_keys[-1] != current_key):
+            seen_keys.append(current_key)
+
+        # Historical keys: every key ever seen for this project ID except the
+        # current one, de-duplicated while preserving first-seen order.
+        return [key for key in dict.fromkeys(seen_keys) if key != current_key]
+
+    @override
     def get_child_context(
         self,
         record: Record,
         context: Context | None,
     ) -> dict[str, Any]:
-        return {"projectId": record["id"]}
+        return {
+            # Stable numeric project ID, used for downstream primary keys.
+            "projectId": record["id"],
+            # Current project key, denormalized onto child records.
+            "projectKey": record.get("key"),
+        }
 
 
 class ProjectVersionStream(JiraStartAtPaginatedStream):
@@ -511,7 +564,10 @@ class ProjectVersionStream(JiraStartAtPaginatedStream):
     parent_stream_type = ProjectStream
     name = "project_versions"
     path = "/project/{projectId}/versions"
-    primary_keys = ("id",)
+    # Composite key anchored on the stable numeric project ID. Keying versions
+    # by project key would wrongly merge versions when a key is renamed, or
+    # when an old key is later reused by a different project.
+    primary_keys = ("projectId", "id")
 
     schema = th.PropertiesList(
         th.Property("self", th.StringType),
@@ -526,7 +582,23 @@ class ProjectVersionStream(JiraStartAtPaginatedStream):
         th.Property("userStartDate", th.StringType),  # not ISO 8601
         th.Property("userReleaseDate", th.StringType),  # not ISO 8601
         th.Property("projectId", th.IntegerType),
+        th.Property("projectKey", th.StringType),  # current project key
     ).to_dict()
+
+    @override
+    def post_process(self, row: Record, context: Context | None = None) -> Record:
+        """Anchor the version to its parent project's stable ID and current key.
+
+        The parent context holds the stable numeric project ID whose versions
+        endpoint was queried, so it is authoritative for the downstream
+        primary key - even if the API payload omits ``projectId``.
+        """
+        if context:
+            row["projectKey"] = context.get("projectKey")
+            project_id = context.get("projectId")
+            if project_id is not None and str(project_id).isdigit():
+                row["projectId"] = int(project_id)
+        return row
 
 
 class IssueStream(JiraStream[str]):
